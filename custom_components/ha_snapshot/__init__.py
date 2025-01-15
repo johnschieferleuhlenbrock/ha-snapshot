@@ -1,14 +1,12 @@
 """
-HA Snapshot: A custom integration to export Home Assistant data into a minified JSON file.
-
-This version merges the original ha_snapshot logic with the condensed gather_home_assistant_data() approach.
+HA Snapshot: A custom integration to export Home Assistant data in a condensed, minified JSON format.
+This version handles older Home Assistant versions that lack 'async_entries_for_device' in the EntityRegistry.
 """
 
 import logging
 import json
 import os
 
-# Home Assistant imports
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.device_registry import async_get as async_get_device_registry
@@ -23,23 +21,44 @@ SERVICE_EXPORT_DATA = "export_data"
 
 def gather_home_assistant_data(hass) -> dict:
     """
-    Gather a condensed view of devices, entities, areas, and integrations.
+    Gather a condensed view of devices, entities, areas, and integrations,
+    skipping "back of house" items (nameless or manufacturer-less).
 
-    Skips devices with no name/manufacturer,
-    and skips entities with no name (often "back of house" objects).
+    Also includes a fallback approach for older Home Assistant installs
+    that lack 'async_entries_for_device' on the EntityRegistry.
     """
+
+    # -- Retrieve the registries --
     device_registry = async_get_device_registry(hass)
     entity_registry = async_get_entity_registry(hass)
     area_registry = async_get_area_registry(hass)
 
-    # Data structure:
+    # Prepare the data structure
     #   {
-    #       "devices": { <device_id>: {...}, ... },
-    #       "areas":   { <area_id>: {...}, ... },
+    #       "devices": {
+    #           device_id: {
+    #               "name": ...,
+    #               "manufacturer": ...,
+    #               "model": ...,
+    #               "sw_version": ...,
+    #               "hw_version": ...,
+    #               "area_id": ...,
+    #               "integration": ...,
+    #               "entities": [...]
+    #           },
+    #           ...
+    #       },
+    #       "areas": {
+    #           area_id: {
+    #               "name": ...,
+    #               "picture": ...
+    #           },
+    #           ...
+    #       },
     #       "integrations": {
-    #           <config_entry_id>: {
-    #               "devices": [],
-    #               "entities": []
+    #           config_entry_id: {
+    #               "devices": [...],
+    #               "entities": [...]
     #           },
     #           ...
     #       }
@@ -50,32 +69,70 @@ def gather_home_assistant_data(hass) -> dict:
         "integrations": {}
     }
 
-    # 1. Collect area info
+    # ----------------------------------------------------------------
+    # 1. Collect AREA info
+    # ----------------------------------------------------------------
+    _LOGGER.debug("Gathering area info from area_registry...")
     for area_id, area in area_registry.areas.items():
         ha_data["areas"][area_id] = {
             "name": area.name,
             "picture": area.picture
         }
 
-    # 2. Collect devices and associated entities
+    # ----------------------------------------------------------------
+    # 2. Collect DEVICES and associated ENTITIES
+    # ----------------------------------------------------------------
+    _LOGGER.debug("Gathering devices from device_registry...")
     for device_id, device in device_registry.devices.items():
-        # Skip unnamed or missing manufacturer
+        # Skip devices without a name or manufacturer to exclude "back of house" items
         if not device.name or not device.manufacturer:
+            _LOGGER.debug(
+                "Skipping device_id=%s because it has no name/manufacturer (name=%r, manufacturer=%r)",
+                device_id, device.name, device.manufacturer
+            )
             continue
 
-        # Grab first config_entry that references this device
+        # Integration (config entry) that references this device
+        # This is typically a set, so we take the first entry if any
         integration_entry_id = next(iter(device.config_entries), None)
         if integration_entry_id:
+            # Create a placeholder for this integration if not present
             ha_data["integrations"].setdefault(
-                integration_entry_id, {"devices": [], "entities": []}
+                integration_entry_id,
+                {"devices": [], "entities": []}
             )
+            # Associate device_id with that integration
             ha_data["integrations"][integration_entry_id]["devices"].append(device_id)
 
-        # Gather entity info
-        entities = []
-        for entity in entity_registry.async_entries_for_device(device_id):
-            # Skip unnamed entities
+        # Attempt to retrieve entities for this device
+        # Some older HA versions lack 'async_entries_for_device' on the registry.
+        try:
+            # If this attribute exists, use it
+            entities_for_device = entity_registry.async_entries_for_device(
+                device_id, include_disabled_entities=False
+            )
+        except AttributeError:
+            # Fall back to a manual iteration
+            _LOGGER.warning(
+                "EntityRegistry has no 'async_entries_for_device'; "
+                "falling back to manual filtering for device_id=%s",
+                device_id
+            )
+            # Filter all known entities in 'entity_registry.entities' by device_id
+            # (Older approach)
+            entities_for_device = [
+                e for e in entity_registry.entities.values()
+                if e.device_id == device_id
+            ]
+
+        # Build an array of entity info to store in "entities" for this device
+        device_entities = []
+        for entity in entities_for_device:
+            # Skip entities with no user-friendly name
             if not entity.name:
+                _LOGGER.debug(
+                    "Skipping entity_id=%s because it has no name", entity.entity_id
+                )
                 continue
 
             entity_info = {
@@ -87,13 +144,15 @@ def gather_home_assistant_data(hass) -> dict:
                 "platform": entity.platform,
                 "area_id": entity.area_id,
             }
-            entities.append(entity_info)
+            device_entities.append(entity_info)
 
-            # Associate this entity with its integration as well
+            # Also tie this entity to the integration in ha_data["integrations"]
             if integration_entry_id:
-                ha_data["integrations"][integration_entry_id]["entities"].append(entity.entity_id)
+                ha_data["integrations"][integration_entry_id]["entities"].append(
+                    entity.entity_id
+                )
 
-        # Populate device info in the dictionary
+        # Populate device info into the "devices" block
         ha_data["devices"][device_id] = {
             "name": device.name,
             "manufacturer": device.manufacturer,
@@ -102,60 +161,64 @@ def gather_home_assistant_data(hass) -> dict:
             "hw_version": device.hw_version,
             "area_id": device.area_id,
             "integration": integration_entry_id,
-            "entities": entities
+            "entities": device_entities
         }
 
+    _LOGGER.debug("Finished gathering Home Assistant data.")
     return ha_data
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """
     Set up the ha_snapshot integration (YAML-based).
-    Requires 'ha_snapshot:' in configuration.yaml to invoke this setup method.
+    Make sure you have 'ha_snapshot:' in configuration.yaml.
     """
 
     async def handle_export_data(call: ServiceCall) -> None:
         """
-        Handle the service call to export the condensed system data to a JSON file.
-        If 'notify' is True, creates a persistent notification with a download link.
+        The main service handler that gathers the data and writes it to /config/www/ha_snapshot_data.json.
+        Use the 'notify' field if you want a persistent notification with a download link.
         """
-        _LOGGER.debug("HA Snapshot (export_data): Called with data: %s", call.data)
+        _LOGGER.debug("ha_snapshot.export_data called with data: %s", call.data)
+
+        # Check if we should display a persistent notification
         notify_user = call.data.get("notify", False)
 
         try:
-            # 1. Gather data
-            _LOGGER.debug("Gathering Home Assistant data in condensed form...")
+            # 1. Gather condensed data
+            _LOGGER.debug("Gathering condensed data from registries...")
             data = gather_home_assistant_data(hass)
 
-            # 2. Determine the path for output JSON
-            _LOGGER.debug("Ensuring /config/www directory exists...")
+            # 2. Ensure /config/www directory exists
+            _LOGGER.debug("Ensuring /config/www exists for file output...")
             www_path = hass.config.path("www")
             if not os.path.exists(www_path):
-                _LOGGER.warning("www folder does not exist; creating it at: %s", www_path)
+                _LOGGER.warning("Directory '/config/www' does not exist; creating now...")
                 os.makedirs(www_path)
 
+            # 3. Build output file path
             output_file = os.path.join(www_path, "ha_snapshot_data.json")
-            _LOGGER.debug("Writing condensed snapshot data to %s", output_file)
+            _LOGGER.debug("Will write data to: %s", output_file)
 
-            # 3. Write data in minified form to keep file size small
+            # 4. Write data in minified JSON form (no extra spaces)
+            #    separators=(',',':') => minimal JSON size
             with open(output_file, "w", encoding="utf-8") as f:
-                # separators=(',',':') removes unnecessary spaces
                 json.dump(data, f, separators=(',', ':'), ensure_ascii=False)
 
-            _LOGGER.info("HA Snapshot: Exported system data to '%s'", output_file)
+            _LOGGER.info("HA Snapshot: Data exported successfully to '%s'.", output_file)
 
-            # 4. Provide a local path for download
+            # 5. Provide /local path for download
             download_url = "/local/ha_snapshot_data.json"
-            _LOGGER.info("Download your snapshot file at: %s", download_url)
+            _LOGGER.info("Snapshot download available at: %s", download_url)
 
-            # 5. Optional: Create a persistent notification with the link
+            # 6. Optional: persistent notification
             if notify_user:
                 title = "HA Snapshot Created"
                 message = (
-                    "Your HA snapshot file is ready. "
+                    "Your HA snapshot file is ready! "
                     f"[Click here to download]({download_url})"
                 )
-                _LOGGER.debug("Creating persistent_notification with title '%s'", title)
+                _LOGGER.debug("Creating persistent_notification with title='%s'", title)
                 hass.async_create_task(
                     hass.services.async_call(
                         "persistent_notification",
@@ -170,9 +233,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
         except Exception as e:
             # Log full traceback
-            _LOGGER.exception("HA Snapshot: Failed to export data. Error: %s", e)
+            _LOGGER.exception("HA Snapshot: Failed to export data due to an error: %s", e)
 
-            # Optionally notify user of error
+            # Optionally notify user if something went wrong
             if notify_user:
                 hass.async_create_task(
                     hass.services.async_call(
@@ -187,24 +250,25 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 )
 
     # Register the custom service
+    _LOGGER.debug("Registering service '%s.%s' for exporting data...", DOMAIN, SERVICE_EXPORT_DATA)
     hass.services.async_register(DOMAIN, SERVICE_EXPORT_DATA, handle_export_data)
-    _LOGGER.info("HA Snapshot: Service '%s.%s' registered.", DOMAIN, SERVICE_EXPORT_DATA)
+    _LOGGER.info("HA Snapshot: Service '%s.%s' registered successfully.", DOMAIN, SERVICE_EXPORT_DATA)
 
     return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """
-    Set up ha_snapshot from a config entry (if you add a config_flow later).
-    Right now, we do nothing special here.
+    Set up ha_snapshot from a Config Flow (if created).
+    Currently, we do nothing special here because it's a YAML-based integration.
     """
-    _LOGGER.debug("HA Snapshot: async_setup_entry called for config entry: %s", entry.entry_id)
+    _LOGGER.debug("HA Snapshot: async_setup_entry called for entry_id=%s", entry.entry_id)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """
-    Unload a config entry if needed.
+    Unload a config entry if needed in the future.
     """
-    _LOGGER.debug("HA Snapshot: async_unload_entry called for config entry: %s", entry.entry_id)
+    _LOGGER.debug("HA Snapshot: async_unload_entry called for entry_id=%s", entry.entry_id)
     return True
