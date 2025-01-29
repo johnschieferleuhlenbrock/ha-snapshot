@@ -1,8 +1,0 @@
-{
-    "name": "HA Snapshot",
-    "domains": ["ha_snapshot"],
-    "country": "US",
-    "homeassistant": "2023.1.0",
-    "zip_release": false
-  }
-  

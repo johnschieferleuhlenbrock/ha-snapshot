@@ -1,7 +1,0 @@
-export_data:
-  name: "Export Data"
-  description: "Export system data to a JSON file for easy analysis."
-  fields:
-    notify:
-      description: "Whether to show a persistent notification with a download link."
-      example: true

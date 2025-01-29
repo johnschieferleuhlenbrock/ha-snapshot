@@ -1,0 +1,7 @@
+{
+  "name": "HA Snapshot",
+  "filename": "custom_components/ha_snapshot/__init__.py",
+  "domains": ["ha_snapshot"],
+  "homeassistant": "2023.1.0",
+  "render_readme": true
+}
