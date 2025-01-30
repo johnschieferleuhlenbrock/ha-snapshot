@@ -1,9 +1,10 @@
 name: Bump Minor Version
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   bump_manifest_version:
@@ -28,25 +29,26 @@ jobs:
           CURRENT_VERSION=$(jq -r '.version' custom_components/ha_snapshot/manifest.json)
           echo "Current version: $CURRENT_VERSION"
 
-          # Split into major.minor.patch (assuming it's valid semver)
+          # Split into major.minor.patch
           IFS='.' read -ra VER_ARR <<< "$CURRENT_VERSION"
           MAJOR="${VER_ARR[0]}"
           MINOR="${VER_ARR[1]}"
           PATCH="${VER_ARR[2]}"
 
-          # Increment the minor version
+          # Increment the minor version, reset patch to 0
           NEW_MINOR=$((MINOR + 1))
           NEW_VERSION="${MAJOR}.${NEW_MINOR}.0"
 
           echo "New version: $NEW_VERSION"
 
-          # Update manifest.json with the new version
+          # Update manifest.json
           jq ".version |= \"$NEW_VERSION\"" custom_components/ha_snapshot/manifest.json > manifest.tmp
           mv manifest.tmp custom_components/ha_snapshot/manifest.json
 
           echo "::set-output name=new_version::$NEW_VERSION"
 
       - name: Commit and push changes
+        id: push_changes
         run: |
           NEW_VERSION="${{ steps.bump_version.outputs.new_version }}"
           echo "Committing and tagging version: v${NEW_VERSION}"
@@ -54,17 +56,39 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Stage the updated manifest
+          # Stage changes
           git add custom_components/ha_snapshot/manifest.json
-          
-          # If manifest.json is unchanged, skip commit/tag
+
+          # Check if there's anything to commit
           if git diff --cached --quiet; then
-            echo "No changes to commit (version might be unchanged). Exiting."
+            echo "No changes to commit. Possibly the version is unchanged. Exiting."
+            echo "::set-output name=need_release::false"
             exit 0
           fi
 
-          # Commit, tag, and push
+          # Commit
           git commit -m "chore: bump minor version to ${NEW_VERSION}"
+
+          # Create a new tag
           git tag "v${NEW_VERSION}"
+
+          # Push commit & tag
           git push origin HEAD:main
           git push origin "v${NEW_VERSION}"
+
+          # Indicate we need to create a release
+          echo "::set-output name=need_release::true"
+
+      - name: Create GitHub Release
+        # Only run if the version was actually updated
+        if: steps.push_changes.outputs.need_release == 'true'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ steps.bump_version.outputs.new_version }}
+          release_name: "v${{ steps.bump_version.outputs.new_version }}"
+          body: |
+            **Automated minor version bump** for HA Snapshot.
+            - This release automatically updates manifest.json to match the new version.
+            - HACS should now see version **${{ steps.bump_version.outputs.new_version }}**.
