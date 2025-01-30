@@ -1,10 +1,12 @@
 {
   "domain": "ha_snapshot",
   "name": "HA Snapshot",
-  "version": "0.3.0",
-  "documentation": "https://github.com/johnschieferleuhlenbrock/ha_snapshot",
+  "version": "0.4.0",
+  "documentation": "https://github.com/johnschieferleuhlenbrock/ha-snapshot",
   "requirements": [],
   "dependencies": [],
   "codeowners": ["@johnschieferleuhlenbrock"],
-  "iot_class": "local_polling"
+  "iot_class": "local_polling",
+
+  "config_flow": true
 }
